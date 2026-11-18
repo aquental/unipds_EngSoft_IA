@@ -1,91 +1,148 @@
+from dataclasses import dataclass
+
+import anthropic
+from google import genai
 from openai import OpenAI
 
-CHEAP_MODEL = "gpt-5.6-luna"
-PREMIUM_MODEL = "gpt-5.6-sol"
+OPENAI_MODEL = "gpt-5.6-luna"
+ANTHROPIC_MODEL = "claude-haiku-4-5"
+GOOGLE_MODEL = "gemini-3.5-flash-lite"
 
-HARD_KEYWORDS = {
-    "analyze",
-    "debug",
-    "design",
-    "prove",
-    "refactor",
-    "strategize",
-}
-
-client = OpenAI()
+openai_client = OpenAI()
+anthropic_client = anthropic.Anthropic()
+google_client = genai.Client()
 
 PRICING = {
-    CHEAP_MODEL: {
+    OPENAI_MODEL: {
         "input": 1.00 / 1_000_000,
-        "cache_write": 1.25 / 1_000_000,
-        "cached_input": 0.10 / 1_000_000,
         "output": 6.00 / 1_000_000,
     },
-    PREMIUM_MODEL: {
-        "input": 5.00 / 1_000_000,
-        "cache_write": 6.25 / 1_000_000,
-        "cached_input": 0.50 / 1_000_000,
-        "output": 30.00 / 1_000_000,
+    ANTHROPIC_MODEL: {
+        "input": 1.00 / 1_000_000,
+        "output": 5.00 / 1_000_000,
+    },
+    GOOGLE_MODEL: {
+        "input": 0.30 / 1_000_000,
+        "output": 2.50 / 1_000_000,
     },
 }
 
 
-def cost_for(model: str, usage) -> float:
-    rates = PRICING[model]
-    details = usage.input_tokens_details
+@dataclass
+class Completion:
+    text: str
+    provider: str
+    model: str
+    input_tokens: int
+    output_tokens: int
+    cost: float
 
-    cached = details.cached_tokens
-    cache_write = details.cache_write_tokens
-    fresh = usage.input_tokens - cached - cache_write
+
+def call_cost(
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+) -> float:
+    rates = PRICING[model]
 
     return (
-        fresh * rates["input"]
-        + cache_write * rates["cache_write"]
-        + cached * rates["cached_input"]
-        + usage.output_tokens * rates["output"]
+        input_tokens * rates["input"]
+        + output_tokens * rates["output"]
     )
 
 
-def is_hard_task(prompt: str) -> bool:
-    words = set(prompt.lower().split())
-    return bool(words & HARD_KEYWORDS)
-
-
-def choose_model(prompt: str) -> str:
-    hard_task = is_hard_task(prompt)
-    long_task = len(prompt) > 500
-
-    return PREMIUM_MODEL if hard_task or long_task else CHEAP_MODEL
-
-
-def generate(prompt: str, model: str) -> float:
-    response = client.responses.create(
+def generate_openai(prompt: str, model: str) -> Completion:
+    response = openai_client.responses.create(
         model=model,
         input=prompt,
     )
-    return cost_for(model, response.usage)
+
+    return Completion(
+        text=response.output_text,
+        provider="openai",
+        model=model,
+        input_tokens=response.usage.input_tokens,
+        output_tokens=response.usage.output_tokens,
+        cost=call_cost(
+            model,
+            response.usage.input_tokens,
+            response.usage.output_tokens,
+        ),
+    )
 
 
-workload = [
-    "Classify this review as positive or negative: I loved it.",
-    "Summarize this sentence in five words: Caching avoids repeated work.",
-    "Debug a recursive function that overflows the stack.",
-    "Design a migration strategy for a database with zero downtime.",
+def generate_anthropic(prompt: str, model: str) -> Completion:
+    response = anthropic_client.messages.create(
+        model=model,
+        max_tokens=256,
+        messages=[
+            {"role": "user", "content": prompt},
+        ],
+    )
+
+    return Completion(
+        text=response.content[0].text,
+        provider="anthropic",
+        model=model,
+        input_tokens=response.usage.input_tokens,
+        output_tokens=response.usage.output_tokens,
+        cost=call_cost(
+            model,
+            response.usage.input_tokens,
+            response.usage.output_tokens,
+        ),
+    )
+
+
+def generate_google(prompt: str, model: str) -> Completion:
+    response = google_client.models.generate_content(
+        model=model,
+        contents=prompt,        # "contents", not "input" or "messages"
+    )
+
+    usage = response.usage_metadata
+    thinking_tokens = usage.thoughts_token_count or 0
+    output_tokens = usage.candidates_token_count + thinking_tokens
+
+    return Completion(
+        text=response.text,
+        provider="google",
+        model=model,
+        input_tokens=usage.prompt_token_count,
+        output_tokens=output_tokens,
+        cost=call_cost(
+            model,
+            usage.prompt_token_count,
+            output_tokens,
+        ),
+    )
+
+
+PROVIDERS = {
+    "openai": generate_openai,
+    "anthropic": generate_anthropic,
+    "google": generate_google,
+}
+
+models = [
+    ("openai", OPENAI_MODEL),
+    ("anthropic", ANTHROPIC_MODEL),
+    ("google", GOOGLE_MODEL),
 ]
 
-routed_total = 0.0
-premium_total = 0.0
+prompt = "Give one practical tip for writing maintainable Python."
 
-for prompt in workload:
-    routed_model = choose_model(prompt)
-    routed_cost = generate(prompt, routed_model)
-    premium_cost = generate(prompt, PREMIUM_MODEL)
+for provider, model in models:
+    result = PROVIDERS[provider](prompt, model)
 
-    routed_total += routed_cost
-    premium_total += premium_cost
+    preview = result.text.replace("\n", " ").strip()[:80]
 
-    print(f"{routed_model:14}  ${routed_cost:.6f}  {prompt}")
-
-print(f"\nAll-premium baseline: ${premium_total:.6f}")
-print(f"Routed workload:      ${routed_total:.6f}")
-print(f"Savings:              ${premium_total - routed_total:.6f}")
+    print(
+        f"{result.provider:10} "
+        f"{result.model:24} "
+        f"in={result.input_tokens:4} "
+        f"out={result.output_tokens:4} "
+        f"${result.cost:.6f}"
+    )
+    print(f"Preview: {preview}")
+    print()
